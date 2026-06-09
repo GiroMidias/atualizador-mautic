@@ -29,10 +29,6 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-clean_value() {
-  echo "${1:-}" | sed 's/<no value>//g'
-}
-
 download_update() {
   log "Baixando update.py..."
 
@@ -49,6 +45,108 @@ download_update() {
 
 extract_version() {
   grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true
+}
+
+detect_version_from_image() {
+  local image="$1"
+
+  echo "$image" | grep -Eoi 'mautic[^:]*:v?[0-9]+(\.[0-9]+)?(\.[0-9]+)?' \
+    | grep -Eo '[0-9]+(\.[0-9]+)?(\.[0-9]+)?' \
+    | head -n 1 || true
+}
+
+detect_version_inside_container() {
+  local cid="$1"
+  local cpath="$2"
+  local image="$3"
+  local version=""
+
+  version=$(docker exec "$cid" sh -lc "cd '$cpath' && php bin/console mautic:version 2>/dev/null" | extract_version || true)
+
+  if [ -z "$version" ]; then
+    version=$(docker exec "$cid" sh -lc "cd '$cpath' && php bin/console --version 2>/dev/null" | extract_version || true)
+  fi
+
+  if [ -z "$version" ]; then
+    version=$(docker exec "$cid" sh -lc "
+      cd '$cpath'
+
+      for file in \
+        app/version.txt \
+        VERSION.txt \
+        version.txt \
+        app/bundles/CoreBundle/Version.php \
+        app/bundles/CoreBundle/ReleaseMetadata.php \
+        composer.json \
+        composer.lock
+      do
+        if [ -f \"\$file\" ]; then
+          grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' \"\$file\" 2>/dev/null | head -n 1 && exit 0
+        fi
+      done
+    " 2>/dev/null || true)
+  fi
+
+  if [ -z "$version" ]; then
+    version=$(detect_version_from_image "$image")
+  fi
+
+  if [ -z "$version" ]; then
+    version="desconhecida"
+  fi
+
+  echo "$version"
+}
+
+find_path_inside_container() {
+  local cid="$1"
+
+  docker exec "$cid" sh -lc '
+    for path in /var/www/html /var/www/html/docroot /var/www/mautic /app /srv/app /srv/mautic; do
+      if [ -f "$path/bin/console" ]; then
+        echo "$path"
+        exit 0
+      fi
+    done
+
+    find /var/www /app /srv -maxdepth 7 -type f -path "*/bin/console" 2>/dev/null \
+      | head -n 1 \
+      | while read console; do dirname "$(dirname "$console")"; done
+  ' 2>/dev/null || true
+}
+
+map_container_path_to_host() {
+  local cid="$1"
+  local cpath="$2"
+  local best_source=""
+  local best_dest=""
+  local best_len=0
+  local src dst len rel
+
+  while IFS='|' read -r src dst; do
+    [ -n "${src:-}" ] || continue
+    [ -n "${dst:-}" ] || continue
+
+    case "$cpath" in
+      "$dst"|"$dst"/*)
+        len=${#dst}
+        if [ "$len" -gt "$best_len" ]; then
+          best_len="$len"
+          best_source="$src"
+          best_dest="$dst"
+        fi
+        ;;
+    esac
+  done < <(docker inspect -f '{{range .Mounts}}{{println .Source "|" .Destination}}{{end}}' "$cid" 2>/dev/null || true)
+
+  if [ -n "$best_source" ]; then
+    rel="${cpath#$best_dest}"
+    echo "${best_source}${rel}"
+  fi
+}
+
+clean_value() {
+  echo "${1:-}" | sed 's/<no value>//g'
 }
 
 add_candidate() {
@@ -74,6 +172,11 @@ score_local_path() {
 
   if has_cmd php; then
     version=$(cd "$path" && php bin/console mautic:version 2>/dev/null | extract_version || true)
+
+    if [ -z "$version" ]; then
+      version=$(cd "$path" && php bin/console --version 2>/dev/null | extract_version || true)
+    fi
+
     if [ -n "$version" ]; then
       score=$((score + 20))
     else
@@ -118,54 +221,6 @@ find_direct_installations() {
   done
 }
 
-map_container_path_to_host() {
-  local cid="$1"
-  local cpath="$2"
-  local best_source=""
-  local best_dest=""
-  local best_len=0
-  local src dst len rel
-
-  while IFS='|' read -r src dst; do
-    [ -n "${src:-}" ] || continue
-    [ -n "${dst:-}" ] || continue
-
-    case "$cpath" in
-      "$dst"|"$dst"/*)
-        len=${#dst}
-
-        if [ "$len" -gt "$best_len" ]; then
-          best_len="$len"
-          best_source="$src"
-          best_dest="$dst"
-        fi
-        ;;
-    esac
-  done < <(docker inspect -f '{{range .Mounts}}{{println .Source "|" .Destination}}{{end}}' "$cid" 2>/dev/null || true)
-
-  if [ -n "$best_source" ]; then
-    rel="${cpath#$best_dest}"
-    echo "${best_source}${rel}"
-  fi
-}
-
-find_path_inside_container() {
-  local cid="$1"
-
-  docker exec "$cid" sh -lc '
-    for path in /var/www/html /var/www/html/docroot /var/www/mautic /app /srv/app /srv/mautic; do
-      if [ -f "$path/bin/console" ]; then
-        echo "$path"
-        exit 0
-      fi
-    done
-
-    find /var/www /app /srv -maxdepth 7 -type f -path "*/bin/console" 2>/dev/null \
-      | head -n 1 \
-      | while read console; do dirname "$(dirname "$console")"; done
-  ' 2>/dev/null || true
-}
-
 find_docker_installations() {
   log "Procurando instalação Docker..."
 
@@ -190,9 +245,7 @@ find_docker_installations() {
       continue
     fi
 
-    version=$(docker exec "$cid" sh -lc "cd '$cpath' && php bin/console mautic:version 2>/dev/null" | extract_version || true)
-    [ -n "$version" ] || version="desconhecida"
-
+    version=$(detect_version_inside_container "$cid" "$cpath" "$image")
     host_path=$(map_container_path_to_host "$cid" "$cpath")
 
     project=$(clean_value "$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$cid" 2>/dev/null || true)")
@@ -201,6 +254,7 @@ find_docker_installations() {
     workdir=$(clean_value "$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$cid" 2>/dev/null || true)")
 
     score=30
+
     echo "$name $image" | grep -qi mautic && score=$((score + 20))
     [ "$version" != "desconhecida" ] && score=$((score + 10))
     [ -n "$host_path" ] && score=$((score + 5))
@@ -257,18 +311,19 @@ run_docker_flow() {
   local service="$7"
   local config_files="$8"
   local workdir="$9"
+  local version="${10}"
 
   log "Rodando diagnóstico Docker..."
   echo "Container: $name"
   echo "Imagem: $image"
   echo "Caminho no container: $cpath"
+  echo "Versão detectada: $version"
   [ -n "$host_path" ] && echo "Caminho no host: $host_path"
   [ -n "$project" ] && echo "Docker Compose project: $project"
   [ -n "$service" ] && echo "Docker Compose service: $service"
   [ -n "$config_files" ] && echo "Compose file: $config_files"
   [ -n "$workdir" ] && echo "Compose dir: $workdir"
 
-  echo "Versão Mautic: $(docker exec "$cid" sh -lc "cd '$cpath' && php bin/console mautic:version 2>/dev/null" | head -n 1 || true)"
   echo "PHP: $(docker exec "$cid" sh -lc "php -v 2>/dev/null | head -n 1" || true)"
 
   if docker exec "$cid" sh -lc 'command -v python3 >/dev/null 2>&1' >/dev/null 2>&1; then
@@ -276,17 +331,19 @@ run_docker_flow() {
     docker exec "$cid" chmod +x /tmp/update.py
 
     log "Gerando diagnóstico completo dentro do container..."
-    docker exec "$cid" python3 /tmp/update.py --path "$cpath" diagnose
+    docker exec "$cid" python3 /tmp/update.py --path "$cpath" diagnose || true
 
     log "Gerando plano dentro do container..."
-    docker exec "$cid" python3 /tmp/update.py --path "$cpath" plan --target "$TARGET"
+    docker exec "$cid" python3 /tmp/update.py --path "$cpath" plan --target "$TARGET" || true
   else
-    echo "python3 não existe dentro do container. Como combinado, não vou instalar nada nele."
-    echo "Diagnóstico básico concluído. Para upgrade Docker completo, o update.py precisa ter fluxo Docker-aware usando docker exec/compose pelo host."
+    echo "python3 não existe dentro do container. Não vou instalar nada nele."
   fi
 
+  log "Diagnóstico Docker concluído."
+  echo "O próximo passo é o update.py usar esses dados para montar o fluxo de upgrade Docker sem alterar nada fora do Mautic."
+
   if [ "$EXECUTE" = "1" ]; then
-    fail "Upgrade automático Docker ainda bloqueado neste instalador para evitar alterar compose/imagem errada. Primeiro vamos implementar o fluxo Docker-aware no update.py."
+    fail "Upgrade automático Docker ainda está bloqueado para evitar trocar imagem/compose errado."
   fi
 }
 
@@ -311,7 +368,7 @@ main() {
   if [ "$kind" = "direct" ]; then
     run_direct_flow "$path"
   elif [ "$kind" = "docker" ]; then
-    run_docker_flow "$path" "$cid" "$name" "$image" "$host_path" "$project" "$service" "$config_files" "$workdir"
+    run_docker_flow "$path" "$cid" "$name" "$image" "$host_path" "$project" "$service" "$config_files" "$workdir" "$version"
   else
     fail "Tipo desconhecido: $kind"
   fi
