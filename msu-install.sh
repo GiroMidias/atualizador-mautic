@@ -177,6 +177,23 @@ score_local_path() {
       version=$(cd "$path" && php bin/console --version 2>/dev/null | extract_version || true)
     fi
 
+    if [ -z "$version" ]; then
+      for file in \
+        "$path/app/version.txt" \
+        "$path/VERSION.txt" \
+        "$path/version.txt" \
+        "$path/app/bundles/CoreBundle/Version.php" \
+        "$path/app/bundles/CoreBundle/ReleaseMetadata.php" \
+        "$path/composer.json" \
+        "$path/composer.lock"
+      do
+        if [ -f "$file" ]; then
+          version=$(grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' "$file" 2>/dev/null | head -n 1 || true)
+          [ -n "$version" ] && break
+        fi
+      done
+    fi
+
     if [ -n "$version" ]; then
       score=$((score + 20))
     else
@@ -274,24 +291,33 @@ select_best_candidate() {
 
 run_direct_flow() {
   local path="$1"
+  local version="$2"
 
   has_cmd python3 || fail "python3 não encontrado no host. Não vou instalar nada automaticamente."
 
   log "Rodando diagnóstico direto..."
+  MSU_INSTALL_TYPE="direct" \
+  MSU_DETECTED_MAUTIC_VERSION="$version" \
   python3 "$UPDATE_FILE" --path "$path" diagnose
 
   log "Gerando plano..."
+  MSU_INSTALL_TYPE="direct" \
+  MSU_DETECTED_MAUTIC_VERSION="$version" \
   python3 "$UPDATE_FILE" --path "$path" plan --target "$TARGET"
 
   if [ "$EXECUTE" = "1" ]; then
     [ "$SERVER_BACKUP" = "1" ] || fail "Para executar upgrade, rode com MSU_SERVER_BACKUP=1 depois de fazer snapshot/backup do servidor."
 
     log "Criando backup local..."
+    MSU_INSTALL_TYPE="direct" \
+    MSU_DETECTED_MAUTIC_VERSION="$version" \
     python3 "$UPDATE_FILE" --path "$path" backup \
       --storage "$STORAGE_PATH" \
       --confirm "CONFIRMO QUE FIZ BACKUP DO SERVIDOR"
 
     log "Executando upgrade..."
+    MSU_INSTALL_TYPE="direct" \
+    MSU_DETECTED_MAUTIC_VERSION="$version" \
     python3 "$UPDATE_FILE" --path "$path" upgrade \
       --confirm "CONFIRMO UPGRADE" \
       --execute
@@ -331,16 +357,38 @@ run_docker_flow() {
     docker exec "$cid" chmod +x /tmp/update.py
 
     log "Gerando diagnóstico completo dentro do container..."
-    docker exec "$cid" python3 /tmp/update.py --path "$cpath" diagnose || true
+    docker exec \
+      -e MSU_INSTALL_TYPE="docker" \
+      -e MSU_DETECTED_MAUTIC_VERSION="$version" \
+      -e MSU_DOCKER_CONTAINER_ID="$cid" \
+      -e MSU_DOCKER_CONTAINER_NAME="$name" \
+      -e MSU_DOCKER_IMAGE="$image" \
+      -e MSU_DOCKER_HOST_PATH="$host_path" \
+      -e MSU_DOCKER_COMPOSE_PROJECT="$project" \
+      -e MSU_DOCKER_COMPOSE_SERVICE="$service" \
+      -e MSU_DOCKER_COMPOSE_FILES="$config_files" \
+      -e MSU_DOCKER_COMPOSE_WORKDIR="$workdir" \
+      "$cid" python3 /tmp/update.py --path "$cpath" diagnose || true
 
     log "Gerando plano dentro do container..."
-    docker exec "$cid" python3 /tmp/update.py --path "$cpath" plan --target "$TARGET" || true
+    docker exec \
+      -e MSU_INSTALL_TYPE="docker" \
+      -e MSU_DETECTED_MAUTIC_VERSION="$version" \
+      -e MSU_DOCKER_CONTAINER_ID="$cid" \
+      -e MSU_DOCKER_CONTAINER_NAME="$name" \
+      -e MSU_DOCKER_IMAGE="$image" \
+      -e MSU_DOCKER_HOST_PATH="$host_path" \
+      -e MSU_DOCKER_COMPOSE_PROJECT="$project" \
+      -e MSU_DOCKER_COMPOSE_SERVICE="$service" \
+      -e MSU_DOCKER_COMPOSE_FILES="$config_files" \
+      -e MSU_DOCKER_COMPOSE_WORKDIR="$workdir" \
+      "$cid" python3 /tmp/update.py --path "$cpath" plan --target "$TARGET" || true
   else
     echo "python3 não existe dentro do container. Não vou instalar nada nele."
   fi
 
   log "Diagnóstico Docker concluído."
-  echo "O próximo passo é o update.py usar esses dados para montar o fluxo de upgrade Docker sem alterar nada fora do Mautic."
+  echo "O próximo passo é implementar o upgrade Docker-aware no update.py sem alterar nada fora do Mautic."
 
   if [ "$EXECUTE" = "1" ]; then
     fail "Upgrade automático Docker ainda está bloqueado para evitar trocar imagem/compose errado."
@@ -366,7 +414,7 @@ main() {
   echo "Caminho: $path"
 
   if [ "$kind" = "direct" ]; then
-    run_direct_flow "$path"
+    run_direct_flow "$path" "$version"
   elif [ "$kind" = "docker" ]; then
     run_docker_flow "$path" "$cid" "$name" "$image" "$host_path" "$project" "$service" "$config_files" "$workdir" "$version"
   else
