@@ -108,25 +108,48 @@ class Context:
 
 
 def detect_mautic_version(path: Path) -> str | None:
+    forced = os.environ.get("MSU_DETECTED_MAUTIC_VERSION", "").strip()
+    if forced:
+        return forced
+
     console = path / "bin" / "console"
     if console.exists():
-        result = run(["php", str(console), "mautic:version"], cwd=path, timeout=30)
-        text = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
-        match = re.search(r"(\d+\.\d+(?:\.\d+)?)", text)
-        if match:
-            return match.group(1)
+        for command in [
+            ["php", str(console), "mautic:version"],
+            ["php", str(console), "--version"],
+        ]:
+            result = run(command, cwd=path, timeout=30)
+            text = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
+            match = re.search(r"(\d+\.\d+(?:\.\d+)?)", text)
+            if match:
+                return match.group(1)
 
     candidates = [
         path / "app" / "version.txt",
         path / "VERSION.txt",
+        path / "version.txt",
+        path / "app" / "bundles" / "CoreBundle" / "Version.php",
+        path / "app" / "bundles" / "CoreBundle" / "ReleaseMetadata.php",
         path / "composer.json",
+        path / "composer.lock",
     ]
+
     for candidate in candidates:
         if candidate.exists():
             text = candidate.read_text(errors="ignore", encoding="utf-8")
             match = re.search(r"(\d+\.\d+(?:\.\d+)?)", text)
             if match:
                 return match.group(1)
+
+    image = os.environ.get("MSU_DOCKER_IMAGE", "")
+    if image:
+        match = re.search(r"mautic[^:]*:v?(\d+(?:\.\d+)?(?:\.\d+)?)", image, flags=re.I)
+        if match:
+            version = match.group(1)
+            if "." not in version:
+                return f"{version}.x"
+            return version
+
     return None
 
 
@@ -153,6 +176,15 @@ def detect_environment(path: Path) -> dict[str, Any]:
         "docker_available": docker["ok"],
         "docker_compose_files": has_compose,
         "compose_candidates": sorted(list({"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} & (files | parent_files))),
+        "install_type": os.environ.get("MSU_INSTALL_TYPE", "direct"),
+        "docker_container_id": os.environ.get("MSU_DOCKER_CONTAINER_ID", ""),
+        "docker_container_name": os.environ.get("MSU_DOCKER_CONTAINER_NAME", ""),
+        "docker_image": os.environ.get("MSU_DOCKER_IMAGE", ""),
+        "docker_host_path": os.environ.get("MSU_DOCKER_HOST_PATH", ""),
+        "docker_compose_project": os.environ.get("MSU_DOCKER_COMPOSE_PROJECT", ""),
+        "docker_compose_service": os.environ.get("MSU_DOCKER_COMPOSE_SERVICE", ""),
+        "docker_compose_files_detected": os.environ.get("MSU_DOCKER_COMPOSE_FILES", ""),
+        "docker_compose_workdir": os.environ.get("MSU_DOCKER_COMPOSE_WORKDIR", ""),
         "plesk_hint": Path("/usr/local/psa").exists(),
         "cpanel_hint": Path("/usr/local/cpanel").exists(),
     }
