@@ -2,13 +2,12 @@
 
 set -e
 
-echo "Instalando Atualizador Mautic..."
-
-sudo apt update
-sudo apt install -y python3 python3-pip curl
+echo "Baixando Atualizador Mautic..."
 
 curl -fsSL -o /tmp/update.py https://raw.githubusercontent.com/GiroMidias/atualizador-mautic/main/update.py
 
 chmod +x /tmp/update.py
 
-sudo python3 /tmp/update.py
+echo "Executando upgrade..."
+
+python3 /tmp/update.py upgrade
